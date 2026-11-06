@@ -238,6 +238,13 @@ def parts($role):
     else error("Unsupported content block: "+(.type // "unknown")) end)
   end;
 def message($role;$content): {type:"message",role:$role,content:($content | parts($role))};
+# Claude's hosted web search maps onto the Codex backend's own web_search tool.
+def web_search_tool:
+  if $ARGS.named.transport!="codex" then error("Unsupported server-side tool")
+  elif ((.blocked_domains // [])|length)>0 then error("Blocked web-search domains are unsupported by this Codex bridge")
+  else {type:"web_search"} + (if ((.allowed_domains // [])|length)>0 then {filters:{allowed_domains:.allowed_domains}} else {} end) end;
+def search_replay: [(.content|arrays)[] | select(.type=="web_search_result") | "- " + (.title // .url) + ": " + .url] |
+  if length==0 then empty else message("assistant";"[Web search results]\n"+join("\n")) end;
 def inputs:
   .messages | map((if .role=="system" then "developer" else .role end) as $role |
     if (.content | type) == "string" then [message($role;.content)]
@@ -246,7 +253,8 @@ def inputs:
       elif $b.type == "tool_result" then
         . + [{type:"function_call_output",call_id:$b.tool_use_id,output:((if $b.is_error then "[Tool error]\n" else "" end) + (if ($b.content|type)=="string" then $b.content else [($b.content // [])[] | if .type=="text" then .text elif .type=="image" then empty else error("Unsupported tool result block") end] | join("\n") end))}] +
           (if ($b.content|type)=="array" then [$b.content[] | select(.type=="image") | message("user";[.])] else [] end)
-      elif $b.type == "thinking" or $b.type == "redacted_thinking" then .
+      elif $b.type == "thinking" or $b.type == "redacted_thinking" or $b.type == "server_tool_use" then .
+      elif $b.type == "web_search_tool_result" then . + [$b | search_replay]
       else . + [message($role;[$b])] end)
     end) | add // [];
 . as $original |
@@ -267,7 +275,7 @@ else . end |
   instructions:(if (.system|type)=="string" then .system else [(.system // [])[] | .text // ""] | join("\n") end),
   input:inputs, store:false, stream:true,
   reasoning:{effort:(if $ARGS.named.effort_override=="true" then $effort else .output_config.effort // $effort end)}, parallel_tool_calls:(.tool_choice.disable_parallel_tool_use != true),
-  tools:[(.tools // [])[] | if (.name|type)!="string" or .input_schema==null then error("Unsupported server-side tool") else {type:"function",name:wire(.name),description:(.description // ""),parameters:.input_schema,strict:false} end]
+  tools:[(.tools // [])[] | if ((.type // "")|startswith("web_search_")) then web_search_tool elif (.name|type)!="string" or .input_schema==null then error("Unsupported server-side tool") else {type:"function",name:wire(.name),description:(.description // ""),parameters:.input_schema,strict:false} end]
 } + (if .tool_choice.type == "any" then {tool_choice:"required"}
      elif .tool_choice.type == "none" then {tool_choice:"none"}
      elif .tool_choice.type == "tool" then {tool_choice:{type:"function",name:wire(.tool_choice.name)}} else {} end) |
@@ -287,7 +295,7 @@ def stop($key):
   if .blocks[$key].open then .blocks[$key].open=false |
     .events += [event("content_block_stop";{index:.blocks[$key].index})] else . end;
 foreach (inputs, "__clcd_eof__") as $rawline
-  ({blocks:{},next:0,tool:false,ended:false,events:[]};
+  ({blocks:{},next:0,tool:false,ended:false,events:[],searches:[],cites:[]};
    ($rawline|rtrimstr("\r")) as $line | .events=[] |
    if $line=="__clcd_eof__" then
      if .ended then . else error("Codex stream ended before completion") end
@@ -298,6 +306,14 @@ foreach (inputs, "__clcd_eof__") as $rawline
        .events=[event("message_start";{message:{id:($e.response.id // "msg_clcd"),type:"message",role:"assistant",model:$model,content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:0,output_tokens:0,cache_creation_input_tokens:0,cache_read_input_tokens:0}}})]
      elif $e.type=="response.output_item.added" and $e.item.type=="function_call" then
        .tool=true | start($id;{type:"tool_use",id:$e.item.call_id,name:($names[0][$e.item.name] // $e.item.name),input:{}})
+     elif $e.type=="response.output_item.added" and $e.item.type=="web_search_call" then
+       start($id;{type:"server_tool_use",id:("srvtoolu_"+$id),name:"web_search",input:{}})
+     elif $e.type=="response.output_item.done" and $e.item.type=="web_search_call" then
+       (if .blocks[$id]==null then start($id;{type:"server_tool_use",id:("srvtoolu_"+$id),name:"web_search",input:{}}) else . end) |
+       .events += [event("content_block_delta";{index:.blocks[$id].index,delta:{type:"input_json_delta",partial_json:({query:($e.item.action.query // "")}|tojson)}})] |
+       stop($id) | .searches += [$id]
+     elif $e.type=="response.output_text.annotation.added" and $e.annotation.type=="url_citation" then
+       .cites += [{title:($e.annotation.title // $e.annotation.url),url:$e.annotation.url}]
      elif $e.type=="response.content_part.added" and ($e.part.type|IN("output_text","refusal")) then
        start($id+":"+($e.content_index|tostring);{type:"text",text:""})
      elif $e.type=="response.output_text.delta" or $e.type=="response.refusal.delta" then
@@ -312,8 +328,14 @@ foreach (inputs, "__clcd_eof__") as $rawline
      elif $e.type=="response.content_part.done" and ($e.part.type|IN("output_text","refusal")) then stop($id+":"+($e.content_index|tostring))
      elif $e.type=="response.completed" or $e.type=="response.incomplete" then
        reduce (.blocks|keys[]) as $k (.;stop($k)) |
+       # Codex reports sources as text citations; they become the last search's result list.
+       (.cites|unique_by(.url)|map({type:"web_search_result",title,url,encrypted_content:"",page_age:null})) as $results |
+       (.searches|length) as $n |
+       reduce range($n) as $i (.;
+         ("result:"+.searches[$i]) as $k |
+         start($k;{type:"web_search_tool_result",tool_use_id:("srvtoolu_"+.searches[$i]),content:(if $i==$n-1 then $results else [] end)}) | stop($k)) |
        .ended=true | ($e.response.usage // {}) as $u |
-       .events += [event("message_delta";{delta:{stop_reason:(if $e.type=="response.incomplete" then "max_tokens" elif .tool then "tool_use" else "end_turn" end),stop_sequence:null},usage:{input_tokens:(($u.input_tokens // 0)-($u.input_tokens_details.cached_tokens // 0)),cache_read_input_tokens:($u.input_tokens_details.cached_tokens // 0),output_tokens:($u.output_tokens // 0)}}),event("message_stop";{})]
+       .events += [event("message_delta";{delta:{stop_reason:(if $e.type=="response.incomplete" then "max_tokens" elif .tool then "tool_use" else "end_turn" end),stop_sequence:null},usage:({input_tokens:(($u.input_tokens // 0)-($u.input_tokens_details.cached_tokens // 0)),cache_read_input_tokens:($u.input_tokens_details.cached_tokens // 0),output_tokens:($u.output_tokens // 0)} + (if $n>0 then {server_tool_use:{web_search_requests:$n}} else {} end))}),event("message_stop";{})]
      elif $e.type=="response.failed" or $e.type=="error" then
        .ended=true | .events=[event("error";{error:{type:"api_error",message:"Codex returned an error."}})]
      else . end
@@ -532,8 +554,12 @@ handle() {
       if .==null then error("Incomplete Codex stream") else . end |
       {id:.id,type:"message",role:"assistant",model:$model,stop_sequence:null,
        stop_reason:(if .status=="incomplete" then "max_tokens" elif any(.output[]; .type=="function_call") then "tool_use" else "end_turn" end),
-       content:[.output[] | if .type=="message" then .content[] | select(.type|IN("output_text","refusal")) | {type:"text",text:(.text//.refusal)}
-         elif .type=="function_call" then {type:"tool_use",id:.call_id,name:($names[0][.name] // .name),input:(.arguments|fromjson)} else empty end],
+       content:([.output[] | if .type=="message" then .content[] | select(.type|IN("output_text","refusal")) | {type:"text",text:(.text//.refusal)}
+         elif .type=="function_call" then {type:"tool_use",id:.call_id,name:($names[0][.name] // .name),input:(.arguments|fromjson)}
+         elif .type=="web_search_call" then {type:"server_tool_use",id:("srvtoolu_"+.id),name:"web_search",input:{query:(.action.query // "")}} else empty end] +
+         ([.output[] | select(.type=="web_search_call") | .id] as $s |
+          [.output[] | select(.type=="message") | .content[] | (.annotations // [])[] | select(.type=="url_citation") | {type:"web_search_result",title:(.title // .url),url,encrypted_content:"",page_age:null}] | unique_by(.url) as $r |
+          [range($s|length) as $i | {type:"web_search_tool_result",tool_use_id:("srvtoolu_"+$s[$i]),content:(if $i==($s|length)-1 then $r else [] end)}])),
        usage:{input_tokens:((.usage.input_tokens // 0)-(.usage.input_tokens_details.cached_tokens // 0)),cache_read_input_tokens:(.usage.input_tokens_details.cached_tokens // 0),cache_creation_input_tokens:0,output_tokens:(.usage.output_tokens // 0)}}' "$conn/stream" >"$conn/answer"; then
       http_error '502 Bad Gateway' 'Incomplete Codex response'; return
     fi
