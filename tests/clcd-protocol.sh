@@ -60,3 +60,13 @@ for requested in opus claude-opus-4-1 fable claude-fable-5-1 sonnet claude-3-5-s
   jq --arg requested "$requested" '.model=$requested' filters/input.json | jq --arg model fallback --arg effort medium --argjson mapping '{"opus":"provider-pro","fable":"provider-pro","sonnet":"provider-standard","haiku":"provider-fast"}' --slurpfile names filters/names.json -f filters/request.jq | jq -e --arg expected "$expected" '.model==$expected' >/dev/null
 done
 printf 'PASS: Claude short/full model roles map correctly; explicit provider IDs pass through\n'
+
+# Modern and legacy structured output, including the optional hook verdict reason.
+for field in output_config.format output_format; do
+  for opt in true false; do
+    jq -n --arg field "$field" --argjson optional "$opt" '{messages:[]} | setpath(($field|split("."));{type:"json_schema",schema:{type:"object",properties:{ok:{type:"boolean"},reason:{type:"string"}},required:(if $optional then ["ok"] else ["ok","reason"] end),additionalProperties:false}})' > filters/schema-input
+    jq --arg model test --arg effort medium --arg transport codex --slurpfile names filters/names.json -f filters/request.jq filters/schema-input |
+      jq -e --argjson optional "$opt" --slurpfile src filters/schema-input '.text.format as $f | $f.type=="json_schema" and $f.strict==($optional|not) and $f.schema==($src[0].output_config.format//$src[0].output_format).schema' >/dev/null
+  done
+done
+printf 'PASS: both JSON Schema formats preserve required and optional verdict fields\n'
