@@ -33,8 +33,9 @@ Supports text, images, function tools, and streaming. Token counts are estimates
 when Claude requests /count_tokens. Unsupported input blocks fail explicitly.
 Claude's adaptive effort is translated; CLCD_EFFORT overrides it when set.
 max_tokens is advisory for subscription requests, enforced for API requests.
-Fixed thinking budgets, sampling and schema controls
-are rejected because this bridge cannot honor them.
+Codex accepts JSON Schema output formats. Schemas with optional or open object
+fields are forwarded without strict decoding; callers must validate results.
+Fixed thinking budgets and sampling controls are rejected.
 HELP
 }
 
@@ -316,7 +317,7 @@ def inputs:
 .output_config.effort as $requested_effort |
 if .temperature!=null or .top_p!=null or .top_k!=null or ((.stop_sequences // [])|length)>0 then
   error("Sampling parameters and stop_sequences are unsupported by this Codex bridge")
-elif .output_config.format!=null or .output_format!=null then
+elif (.output_config.format!=null or .output_format!=null) and $ARGS.named.transport!="codex" then
   error("Structured output format controls are unsupported by this Codex bridge")
 elif .thinking.type=="enabled" then
   error("Fixed thinking budgets are unsupported; use adaptive thinking or CLCD_EFFORT")
@@ -331,7 +332,12 @@ else . end |
   input:inputs, store:false, stream:true,
   reasoning:{effort:(if $ARGS.named.effort_override=="true" then $effort else .output_config.effort // $effort end)}, parallel_tool_calls:(.tool_choice.disable_parallel_tool_use != true),
   tools:(if $search!=null then [$search] else [(.tools // [])[] | if (.name|type)!="string" or .input_schema==null then error("Unsupported server-side tool") else {type:"function",name:wire(.name),description:(.description // ""),parameters:.input_schema,strict:false} end] end)
-} + (if $search!=null then (if ($original.tool_choice.type|IN("any","tool")) then {tool_choice:{type:"web_search"}} else {tool_choice:"auto"} end)
+} + (if ($original.output_config.format!=null and $original.output_format!=null and $original.output_config.format!=$original.output_format) then error("Conflicting output formats")
+     else ($original.output_config.format // $original.output_format) as $f |
+       if $f==null then {} elif $f.type=="json_schema" and ($f.schema|type)=="object" then
+         {text:{format:{type:"json_schema",name:"structured_response",strict:([$f.schema | .. | objects | select(.type=="object" or has("properties")) | select(.additionalProperties!=false or ((.required//[])|sort)!=((.properties//{})|keys))] | length==0),schema:$f.schema}}}
+       else error("Expected a JSON Schema output format") end end)
+  + (if $search!=null then (if ($original.tool_choice.type|IN("any","tool")) then {tool_choice:{type:"web_search"}} else {tool_choice:"auto"} end)
      elif .tool_choice.type == "any" then {tool_choice:"required"}
      elif .tool_choice.type == "none" then {tool_choice:"none"}
      elif .tool_choice.type == "tool" then {tool_choice:{type:"function",name:wire(.tool_choice.name)}} else {} end) |
