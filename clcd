@@ -144,7 +144,21 @@ auth_pid='' server_pid='' claude_pid=''
 
 kill_tree() {
   local pid=$1 child
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill_tree "$child"; done
+  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && [ "$pid" != "$$" ] || return 0
+  # Use one snapshot: the traversal must not discover subprocesses it creates.
+  for child in $(ps -axo pid=,ppid= | awk -v root="$pid" -v self="$$" '
+    $1 > 1 && $1 != self { parent[$1]=$2 }
+    END {
+      for (p in parent) {
+        q=p
+        for (depth=0; depth<64 && q in parent; depth++) {
+          if (parent[q]==root) {print p; break}
+          q=parent[q]
+        }
+      }
+    }'); do
+    kill "$child" 2>/dev/null || true
+  done
   kill "$pid" 2>/dev/null || true
 }
 cleanup() {
@@ -479,7 +493,6 @@ chunks() {
   local line
   while IFS= read -r line; do
     printf '%x\r\n%s\n\r\n' "$((${#line} + 1))" "$line" 2>/dev/null || {
-      [ -z "${upstream_pid:-}" ] || stop_upstream
       return 1
     }
   done
@@ -577,7 +590,7 @@ clcd_handler() {
   set -euo pipefail
   local conn upstream_pid='' upstream_status=502
   conn=$(mktemp -d "$runtime/request.XXXXXXXX")
-  trap 'stop_upstream; rm -rf -- "$conn"' EXIT
+  trap 'trap - EXIT; stop_upstream; rm -rf -- "$conn"' EXIT
   if [ "$transport" = codex ]; then exec 5<>"$runtime/auth-in" 6<>"$runtime/auth-out"; fi
   handle "$conn" || true
   rm -rf -- "$conn"
